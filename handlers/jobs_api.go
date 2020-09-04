@@ -8,7 +8,6 @@ import (
 
 func RegisterJob() {
 	http.HandleFunc("/job/status", status)
-	http.HandleFunc("/job/list", list)
 }
 
 // status checks the status of the job given UID
@@ -36,21 +35,4 @@ func status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing UID argument", 300)
 		return
 	}
-}
-
-// list all the jobs
-func list(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Not supported request method.", 405)
-		return
-	}
-	result := listJobs(getJobClient())
-
-	out, err := json.Marshal(result)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	fmt.Fprintf(w, string(out))
 }

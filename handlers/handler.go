@@ -52,7 +52,6 @@ func (handler *SQSHandler) StartServer() error {
 
 	go handler.StartConsumingProcess()
 	go handler.StartMonitoringProcess()
-	go handler.RemoveCompletedJobsProcess()
 
 	glog.Info("The server is started")
 
@@ -137,7 +136,9 @@ func (handler *SQSHandler) StartMonitoringProcess() {
 			if jobInfo.Status == "Completed" {
 				nextMonitoredJobs = append(nextMonitoredJobs, jobInfo)
 			} else {
+
 				k8sJob, err := GetJobStatusByID(jobInfo.UID)
+
 				if err != nil {
 					glog.Errorf("Can not get k8s job %s. Detail %s. Resend the message to the queue", jobInfo.Name, err)
 					handler.ResendSQSMessage(handler.QueueURL, jobInfo.SQSMessage)
@@ -155,15 +156,6 @@ func (handler *SQSHandler) StartMonitoringProcess() {
 		handler.Mu.Unlock()
 
 		time.Sleep(30 * time.Second)
-	}
-}
-
-// RemoveCompletedJobsProcess starts the process to remove completed jobs
-func (handler *SQSHandler) RemoveCompletedJobsProcess() {
-	for {
-		time.Sleep(300 * time.Second)
-		glog.Info("Start to remove completed jobs")
-		RemoveCompletedJobs(handler.MonitoredJobs)
 	}
 }
 
@@ -275,10 +267,15 @@ func (handler *SQSHandler) HandleSQSMessage(message *sqs.Message) error {
 	glog.Infof("Start to run %d jobs", len(jobMap))
 
 	for objectPath, jobConfig := range jobMap {
-		for GetNumberRunningJobs() > GetMaxJobConfig() {
+		for handler.GetNumberRunningJobs() > GetMaxJobConfig() {
 			time.Sleep(5 * time.Second)
 		}
-		jobInfo, err := CreateK8sJob(objectPath, jobConfig)
+
+		glog.Info("create sower job")
+
+		jobInfo, err := CreateSowerJob(objectPath, jobConfig)
+
+		//jobInfo, err := CreateK8sJob(objectPath, jobConfig)
 		if err != nil {
 			glog.Infof("Error :%s", err)
 			glog.Errorln(err)
@@ -362,4 +359,16 @@ func (handler *SQSHandler) getJobStatusByCheckingMonitoredJobs(url string) strin
 		}
 	}
 	return ""
+}
+
+// GetNumberRunningJobs returns number of k8s running jobs dispatched by the service
+func (handler *SQSHandler) GetNumberRunningJobs() int {
+	nRunningJobs := 0
+	for _, jobInfo := range handler.MonitoredJobs {
+		if jobInfo.Status == "Running" || jobInfo.Status == "Unknown" {
+			nRunningJobs++
+		}
+	}
+	return nRunningJobs
+
 }

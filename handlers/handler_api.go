@@ -10,7 +10,6 @@ import (
 func (handler *SQSHandler) RegisterSQSHandler() {
 	http.HandleFunc("/jobConfig", handler.HandleJobConfig)
 	http.HandleFunc("/dispatchJob", handler.HandleDispatchJob)
-	http.HandleFunc("/indexingJobStatus", handler.GetIndexingJobStatus)
 }
 
 // HandleJobConfig handles job config endpoints
@@ -97,13 +96,6 @@ func (handler *SQSHandler) dispatchJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Fprintf(w, "Successfully dispatch a new job!")
-}
-
-// GetIndexingJobStatus get indexing job status
-func (handler *SQSHandler) GetIndexingJobStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		handler.getIndexingJobStatus(w, r)
-	}
 }
 
 // getIndexingJobStatus get indexing job status
