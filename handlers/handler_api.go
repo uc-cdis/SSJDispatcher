@@ -63,7 +63,7 @@ func (handler *SQSHandler) deleteJobConfig(w http.ResponseWriter, r *http.Reques
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
-	fmt.Fprintf(w, "Successfully delete the job")
+	w.Write([]byte("Successfully delete the job"))
 }
 
 func (handler *SQSHandler) listJobConfigs(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +72,7 @@ func (handler *SQSHandler) listJobConfigs(w http.ResponseWriter, r *http.Request
 		msg := fmt.Sprintf("failed to list job config; encountered error: %s", err)
 		http.Error(w, msg, http.StatusInternalServerError)
 	}
-	fmt.Fprintf(w, str)
+	w.Write([]byte(str))
 }
 
 // HandleDispatchJob dispatch an job
@@ -116,7 +116,7 @@ func (handler *SQSHandler) getIndexingJobStatus(w http.ResponseWriter, r *http.R
 	url := r.URL.Query().Get("url")
 	if url != "" {
 		status := handler.getJobStatusByCheckingMonitoredJobs(url)
-		fmt.Fprintf(w, status)
+		w.Write([]byte(status))
 	} else {
 		http.Error(w, "Missing url argument", 300)
 		return

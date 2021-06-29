@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
 	"github.com/golang/glog"
 )
 
@@ -18,40 +18,47 @@ const (
 )
 
 type SQSHandler struct {
-	QueueURL      string
-	Start         bool
-	JobConfigs    []JobConfig
-	MonitoredJobs []*JobInfo
-	Mu            sync.Mutex
+	QueueURL   string
+	Start      bool
+	JobConfigs []JobConfig
+	sqsClient  sqsiface.SQSAPI
+	jobHandler *jobHandler
 }
 
 type JobConfig struct {
-	Name           string      `name`
-	Pattern        string      `pattern`
-	Image          string      `image`
-	ImageConfig    interface{} `image_config`
-	RequestCPU     string      `request_cpu`
-	RequestMem     string      `request_mem`
-	DeadLine       int64       `deadline`
-	ServiceAccount string      `serviceaccount`
+	Name           string
+	Pattern        string
+	Image          string
+	ImageConfig    interface{}
+	RequestCPU     string
+	RequestMem     string
+	DeadLine       int64
+	ServiceAccount string
 }
 
 type RetryMessage struct {
-	Bucket string `bucket`
-	Key    string `key`
+	Bucket string
+	Key    string
 }
 
 // NewSQSHandler creates new SQSHandler instance
 func NewSQSHandler(queueURL string) *SQSHandler {
 	sqsHandler := new(SQSHandler)
 	sqsHandler.QueueURL = queueURL
-	//sqsHandler.PatternMap = GetNewImagePatternMap()
+
+	var err error
+	sqsHandler.sqsClient, err = NewSQSClient()
+	if err != nil {
+		glog.Fatalf("error creating shared client: %s", err)
+	}
+
+	sqsHandler.jobHandler = NewJobHandler()
+
 	return sqsHandler
 }
 
 // StartServer starts a server
 func (handler *SQSHandler) StartServer() error {
-
 	glog.Info("Starting a new server ...")
 
 	go handler.StartConsumingProcess()
@@ -61,106 +68,71 @@ func (handler *SQSHandler) StartServer() error {
 	glog.Info("The server is started")
 
 	return nil
-
 }
 
 // StartConsumingProcess starts consumming the queue
 func (handler *SQSHandler) StartConsumingProcess() error {
-	newClient, err := NewSQSClient()
-	if err != nil {
-		return err
-	}
-
 	receiveParams := &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(handler.QueueURL),
 		MaxNumberOfMessages: aws.Int64(1),
 		VisibilityTimeout:   aws.Int64(30),
 		WaitTimeSeconds:     aws.Int64(20),
 	}
+
 	for {
 		time.Sleep(1 * time.Second)
-		receiveResp, err := newClient.ReceiveMessage(receiveParams)
+
+		glog.Infof("[StartConsumingProcess] poll for messages (%d seconds)", *receiveParams.WaitTimeSeconds)
+		// This is a long polling action if WaitTimeSeconds is above 0. This will
+		// block until a message is received or this times out.
+		receiveResp, err := handler.sqsClient.ReceiveMessage(receiveParams)
 		if err != nil {
-			glog.Error(err)
+			glog.Errorf("[StartConsumingProcess] error receiving messages: %s", err)
 		}
+		glog.Infof("[StartConsumingProcess] received %d messages", len(receiveResp.Messages))
 
 		for _, message := range receiveResp.Messages {
 			err := handler.HandleSQSMessage(message)
+			glog.Infof("[StartConsumingProcess] handled message %s (error=%t)", *message.MessageId, err != nil)
+
 			if err != nil {
 				glog.Errorf("Can not process the message. Error %s. Message %s", err, *message.Body)
 				continue
 			}
 
-			handler.RemoveSQSMessage(message)
-
+			if err := handler.RemoveSQSMessage(message); err != nil {
+				glog.Infof("[StartConsumingProcess] error removing message %s: %s", *message.MessageId, err)
+			} else {
+				glog.Infof("[StartConsumingProcess] message removed %s", *message.MessageId)
+			}
 		}
-
 	}
 }
 
 // RemoveSQSMessage removes SQS message
 func (handler *SQSHandler) RemoveSQSMessage(message *sqs.Message) error {
-	newClient, err := NewSQSClient()
-	if err != nil {
-		return err
-	}
 	deleteParams := &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(handler.QueueURL), // Required
 		ReceiptHandle: message.ReceiptHandle,        // Required
 	}
-	_, err = newClient.DeleteMessage(deleteParams) // No response returned when successed.
-	if err != nil {
+	// No response returned when successed.
+	if _, err := handler.sqsClient.DeleteMessage(deleteParams); err != nil {
 		glog.Error(err)
 		return err
 	}
-	glog.Infof("Message ID: %s has beed deleted.\n\n", *message.MessageId)
+	glog.Infof("[RemoveSQSMessage] message %s has been removed", *message.MessageId)
 	return nil
-}
-
-// ResendSQSMessage resends the message
-func (handler *SQSHandler) ResendSQSMessage(queueURL string, message *sqs.Message) error {
-	newClient, err := NewSQSClient()
-	if err != nil {
-		return err
-	}
-	sentMessageInput := &sqs.SendMessageInput{
-		MessageBody: message.Body,
-		QueueUrl:    aws.String(queueURL),
-	}
-	_, err = newClient.SendMessage(sentMessageInput)
-	return err
-
 }
 
 // StartMonitoringProcess starts the process to monitor the created job
 func (handler *SQSHandler) StartMonitoringProcess() {
 	for {
-		var nextMonitoredJobs []*JobInfo
-		handler.Mu.Lock()
-		for _, jobInfo := range handler.MonitoredJobs {
-			if jobInfo.Status == "Completed" {
-				nextMonitoredJobs = append(nextMonitoredJobs, jobInfo)
-			} else {
-				k8sJob, err := GetJobStatusByID(jobInfo.UID)
-				if err != nil {
-					jobInfo.Status = "Unknown"
-				} else {
-					glog.Infof("%s: %s", k8sJob.Name, k8sJob.Status)
-					if k8sJob.Status == "Unknown" || k8sJob.Status == "Running" || k8sJob.Status == "Completed" {
-						jobInfo.Status = k8sJob.Status
-					} else if k8sJob.Status == "Failed" {
-						if jobInfo.Retries < MAX_RETRIES {
-							glog.Errorf("The k8s job %s failed. Detail %s. Resend the message to the queue", jobInfo.Name, err)
-							handler.ResendSQSMessage(handler.QueueURL, jobInfo.SQSMessage)
-							jobInfo.Retries += 1
-						}
-					}
-				}
-				nextMonitoredJobs = append(nextMonitoredJobs, jobInfo)
-			}
+		jobs := handler.jobHandler.listJobs().JobInfo
+		glog.Infof("[StartMonitoringProcess] found %d jobs", len(jobs))
+
+		for _, jobInfo := range jobs {
+			glog.Infof("[StartMonitoringProcess] checking: %q - status: %q [%s]", jobInfo.Name, jobInfo.Status, jobInfo.DetailedStatus())
 		}
-		handler.MonitoredJobs = nextMonitoredJobs
-		handler.Mu.Unlock()
 
 		time.Sleep(30 * time.Second)
 	}
@@ -168,25 +140,12 @@ func (handler *SQSHandler) StartMonitoringProcess() {
 
 // RemoveCompletedJobsProcess starts the process to remove completed jobs
 func (handler *SQSHandler) RemoveCompletedJobsProcess() {
+	sleepDuration := time.Duration(GetCleanupTime()) * time.Second
+
 	for {
-		time.Sleep(time.Duration(GetCleanupTime()) * time.Second)
-		glog.Info("Start to remove completed jobs")
-		handler.Mu.Lock()
-		var tmp []*JobInfo
-		deletedJobs := RemoveCompletedJobs(handler.MonitoredJobs)
-		for _, jobInfo := range handler.MonitoredJobs {
-			var isDeleted = false
-			for _, jobid := range deletedJobs {
-				if jobInfo.UID == jobid {
-					isDeleted = true
-				}
-			}
-			if isDeleted == false {
-				tmp = append(tmp, jobInfo)
-			}
-		}
-		handler.MonitoredJobs = tmp
-		handler.Mu.Unlock()
+		time.Sleep(sleepDuration)
+		glog.Info("[RemoveCompletedJobsProcess] remove completed jobs")
+		handler.jobHandler.RemoveCompletedJobs()
 	}
 }
 
@@ -213,7 +172,6 @@ The format of a SQS message body:
 	}
 }
 */
-
 func getObjectsFromSQSMessage(msgBody string) []string {
 	objectPaths := make([]string, 0)
 	mapping := make(map[string][]interface{})
@@ -275,14 +233,8 @@ the message is properly handle before it actually deleted
 
 */
 func (handler *SQSHandler) HandleSQSMessage(message *sqs.Message) error {
-
 	jsonBody := *message.Body
 	objectPaths := getObjectsFromSQSMessage(jsonBody)
-
-	jobNameList := make([]string, 0)
-	for _, jobConfig := range handler.JobConfigs {
-		jobNameList = append(jobNameList, jobConfig.Name)
-	}
 
 	jobMap := make(map[string]JobConfig)
 	for _, objectPath := range objectPaths {
@@ -293,31 +245,29 @@ func (handler *SQSHandler) HandleSQSMessage(message *sqs.Message) error {
 			}
 		}
 	}
-	glog.Info("message:", jsonBody)
-
-	glog.Infof("Start to run %d jobs", len(jobMap))
+	// glog.Info("message:", jsonBody)
+	glog.Infof("[HandleSQSMessage] Start to run %d jobs", len(jobMap))
 
 	for objectPath, jobConfig := range jobMap {
-		for GetNumberRunningJobs() > GetMaxJobConfig() {
+		runningJobs := handler.jobHandler.GetNumberRunningJobs()
+		maxJobs := GetMaxJobConfig()
+		for runningJobs > maxJobs {
+			glog.Infof("[HandleSQSMessage] running jobs greater than max jobs (%d/%d)", runningJobs, maxJobs)
 			time.Sleep(5 * time.Second)
 		}
 		jobInfo, err := CreateK8sJob(objectPath, jobConfig)
 		if err != nil {
-			glog.Infof("Error :%s", err)
+			glog.Errorf("[HandleSQSMessage] error %s", err)
 			glog.Errorln(err)
 			return err
 		}
 		jobInfo.SQSMessage = message
-		out, err := json.Marshal(jobInfo)
-		if err != nil {
+		if _, err := json.Marshal(jobInfo); err != nil {
 			glog.Infof("Error :%s", err)
 			glog.Errorln(err)
 			return err
 		}
-		glog.Info(string(out))
-		handler.Mu.Lock()
-		handler.MonitoredJobs = append(handler.MonitoredJobs, jobInfo)
-		handler.Mu.Unlock()
+		// glog.Info(string(out))
 	}
 
 	return nil
@@ -331,8 +281,7 @@ func (handler *SQSHandler) handleAddNewJobConfig(jsonBytes []byte) error {
 	if jobConfig.Name != "" && jobConfig.Image != "" {
 		handler.JobConfigs = append(handler.JobConfigs, jobConfig)
 	} else {
-
-		return errors.New("Name and image args are required")
+		return errors.New("name and image args are required")
 	}
 	return nil
 }
@@ -344,7 +293,8 @@ func (handler *SQSHandler) handleDeleteJobConfig(pattern string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("There is no job with provided pattern\n %s", pattern)
+
+	return fmt.Errorf("there is no job with provided pattern %s", pattern)
 }
 
 func (handler *SQSHandler) handleListJobConfigs() (string, error) {
@@ -363,7 +313,6 @@ func (handler *SQSHandler) handleListJobConfigs() (string, error) {
 RetryCreateIndexingJob creates manually job
 */
 func (handler *SQSHandler) RetryCreateIndexingJob(jsonBytes []byte) error {
-
 	retryMessage := RetryMessage{}
 	if err := json.Unmarshal(jsonBytes, &retryMessage); err != nil {
 		return err
@@ -379,7 +328,7 @@ func (handler *SQSHandler) RetryCreateIndexingJob(jsonBytes []byte) error {
 }
 
 func (handler *SQSHandler) getJobStatusByCheckingMonitoredJobs(url string) string {
-	for _, jobInfo := range handler.MonitoredJobs {
+	for _, jobInfo := range handler.jobHandler.listJobs().JobInfo {
 		if jobInfo.URL == url {
 			return jobInfo.Status
 		}

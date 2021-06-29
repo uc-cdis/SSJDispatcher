@@ -30,7 +30,6 @@ func NewSQSClient() (sqsiface.SQSAPI, error) {
 		sess, _ := session.NewSession()
 		return sqs.New(sess), nil
 	}
-
 }
 
 // loadCredentialFromConfigFile loads AWS credentials from the config file

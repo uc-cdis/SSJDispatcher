@@ -19,7 +19,8 @@ func status(w http.ResponseWriter, r *http.Request) {
 	}
 	UID := r.URL.Query().Get("UID")
 	if UID != "" {
-		result, errUID := GetJobStatusByID(UID)
+		jobHandler := NewJobHandler()
+		result, errUID := jobHandler.GetJobStatusByID(UID)
 		if errUID != nil {
 			http.Error(w, errUID.Error(), 500)
 			return
@@ -44,7 +45,9 @@ func list(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not supported request method.", 405)
 		return
 	}
-	result := listJobs(getJobClient())
+
+	jobHandler := NewJobHandler()
+	result := jobHandler.listJobs()
 
 	out, err := json.Marshal(result)
 	if err != nil {

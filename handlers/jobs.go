@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/golang/glog"
 
@@ -12,6 +13,7 @@ import (
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	batchtypev1 "k8s.io/client-go/kubernetes/typed/batch/v1"
 	"k8s.io/client-go/rest"
@@ -22,8 +24,22 @@ var (
 	falseVal = false
 )
 
+const (
+	appLabel = "ssjdispatcherjob"
+)
+
 type JobsArray struct {
 	JobInfo []JobInfo `json:"jobs"`
+}
+
+type jobHandler struct {
+	jobClient batchtypev1.JobInterface
+}
+
+func NewJobHandler() *jobHandler {
+	return &jobHandler{
+		jobClient: getJobClient(),
+	}
 }
 
 type JobInfo struct {
@@ -31,8 +47,12 @@ type JobInfo struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	URL        string `json:"url"`
-	Retries    int    `json:"retries"`
+	jobStatus  *batchv1.JobStatus
 	SQSMessage *sqs.Message
+}
+
+func (j *JobInfo) DetailedStatus() string {
+	return fmt.Sprintf("Succeeded:%d - Failed:%d - Active:%d - Started:%v - Completed:%v", j.jobStatus.Succeeded, j.jobStatus.Failed, j.jobStatus.Failed, j.jobStatus.StartTime, j.jobStatus.CompletionTime)
 }
 
 func getJobClient() batchtypev1.JobInterface {
@@ -50,22 +70,18 @@ func getJobClient() batchtypev1.JobInterface {
 	return jobsClient
 }
 
-func getJobByID(jc batchtypev1.JobInterface, jobid string) (*batchv1.Job, error) {
-	jobs, err := jc.List(metav1.ListOptions{})
+func (h *jobHandler) getJobByID(jobId string) (*batchv1.Job, error) {
+	job, err := h.jobClient.Get(jobId, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
-	for _, job := range jobs.Items {
-		if jobid == string(job.GetUID()) {
-			return &job, nil
-		}
-	}
-	return nil, fmt.Errorf("job with jobid %s not found", jobid)
+
+	return job, nil
 }
 
 //GetJobStatusByID returns job status given job id
-func GetJobStatusByID(jobid string) (*JobInfo, error) {
-	job, err := getJobByID(getJobClient(), jobid)
+func (h *jobHandler) GetJobStatusByID(jobid string) (*JobInfo, error) {
+	job, err := h.getJobByID(jobid)
 	if err != nil {
 		return nil, err
 	}
@@ -76,47 +92,43 @@ func GetJobStatusByID(jobid string) (*JobInfo, error) {
 	return &ji, nil
 }
 
-// delete job along with dependencies by job id
-// it should be called when job's status is completed
-func deleteJobByID(jobid string, afterSeconds int64) error {
-
-	client := getJobClient()
-	job, err := getJobByID(client, jobid)
-	if err != nil {
-		return err
-	}
-
+// deleteJobByName deletes a job along with its dependencies by job name.
+func (h *jobHandler) deleteJobByName(jobName string, afterSeconds int64) error {
 	deleteOption := metav1.NewDeleteOptions(afterSeconds)
 
 	var deletionPropagation metav1.DeletionPropagation = "Background"
 	deleteOption.PropagationPolicy = &deletionPropagation
 
-	if err = client.Delete(job.Name, deleteOption); err != nil {
-		glog.Infoln(err)
+	if err := h.jobClient.Delete(jobName, deleteOption); err != nil {
+		glog.Errorf("[deleteJobByName] error deleting job %s: %s", jobName, err)
+		return err
 	}
 
 	return nil
-
 }
 
-func listJobs(jc batchtypev1.JobInterface) JobsArray {
+func (h *jobHandler) listJobs() JobsArray {
 	jobs := JobsArray{}
 
-	jobsList, err := jc.List(metav1.ListOptions{})
+	labelSelector := labels.SelectorFromSet(map[string]string{"app": appLabel}).String()
 
+	glog.Infof("[listJobs] list all jobs with label %q", labelSelector)
+
+	jobsList, err := h.jobClient.List(metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
 	if err != nil {
+		glog.Errorf("[listJobs] error listing jobs: %s", err)
 		return jobs
 	}
 
 	for _, job := range jobsList.Items {
-		if job.Labels["app"] != "ssjdispatcherjob" {
-			continue
-		}
-		ji := JobInfo{}
-		ji.Name = job.Name
-		ji.UID = string(job.GetUID())
-		ji.Status = jobStatusToString(&job.Status)
-		jobs.JobInfo = append(jobs.JobInfo, ji)
+		jobs.JobInfo = append(jobs.JobInfo, JobInfo{
+			Name:      job.Name,
+			UID:       string(job.GetUID()),
+			Status:    jobStatusToString(&job.Status),
+			jobStatus: &job.Status,
+		})
 	}
 
 	return jobs
@@ -141,21 +153,20 @@ func jobStatusToString(status *batchv1.JobStatus) string {
 }
 
 // RemoveCompletedJobs removes all completed k8s jobs dispatched by the service
-func RemoveCompletedJobs(monitoredJobs []*JobInfo) []string {
-	jobs := listJobs(getJobClient())
+func (h *jobHandler) RemoveCompletedJobs() []string {
+	jobs := h.listJobs()
 	var deletedJobs []string
-	for i := 0; i < len(jobs.JobInfo); i++ {
-		job := jobs.JobInfo[i]
-		if job.Status == "Completed" {
-			isMonitoredJob := false
-			for _, jobInfo := range monitoredJobs {
-				if job.UID == jobInfo.UID {
-					isMonitoredJob = true
-					break
-				}
-			}
-			if isMonitoredJob == true {
-				deleteJobByID(job.UID, GRACE_PERIOD)
+	for _, job := range jobs.JobInfo {
+		glog.Infof("[RemoveCompletedJobs] check to remove job %s: %q [%s]", job.Name, job.Status, job.DetailedStatus())
+
+		isCompleted := job.Status == "Completed"
+		isFailedAndExceededRetries := job.Status == "Failed" && job.jobStatus.Failed >= int32(MAX_RETRIES)
+
+		if isCompleted || isFailedAndExceededRetries {
+			glog.Infof("[RemoveCompletedJobs] removing job %s with %d second(s) grace period", job.Name, GRACE_PERIOD)
+			if err := h.deleteJobByName(job.Name, GRACE_PERIOD); err != nil {
+				glog.Errorf("[RemoveCompletedJobs] error deleting job %s: %s", job.Name, err)
+			} else {
 				deletedJobs = append(deletedJobs, job.UID)
 			}
 		}
@@ -164,8 +175,8 @@ func RemoveCompletedJobs(monitoredJobs []*JobInfo) []string {
 }
 
 // GetNumberRunningJobs returns number of k8s running jobs dispatched by the service
-func GetNumberRunningJobs() int {
-	jobs := listJobs(getJobClient())
+func (h *jobHandler) GetNumberRunningJobs() int {
+	jobs := h.listJobs()
 	nRunningJobs := 0
 	for i := 0; i < len(jobs.JobInfo); i++ {
 		job := jobs.JobInfo[i]
@@ -178,7 +189,6 @@ func GetNumberRunningJobs() int {
 
 // CreateK8sJob creates a k8s job to handle s3 object
 func CreateK8sJob(inputURL string, jobConfig JobConfig) (*JobInfo, error) {
-
 	// Skip all checking errors since aws cred file was properly loaded already
 	credBytes, _ := ReadFile(LookupCredFile())
 	regionIf, _ := GetValueFromJSON(credBytes, []string{"AWS", "region"})
@@ -208,11 +218,11 @@ func CreateK8sJob(inputURL string, jobConfig JobConfig) (*JobInfo, error) {
 	jobsClient := getJobClient()
 	randname := GetRandString(5)
 	name := fmt.Sprintf("%s-%s", jobConfig.Name, randname)
-	glog.Infoln("job input URL: ", inputURL)
+	glog.Infof("job input URL: %s", inputURL)
 	var deadline int64 = 72000
-	var backoff int32 = 0
+
 	labels := make(map[string]string)
-	labels["app"] = "ssjdispatcherjob"
+	labels["app"] = appLabel
 
 	if jobConfig.RequestCPU == "" {
 		jobConfig.RequestCPU = "500m"
@@ -261,7 +271,7 @@ func CreateK8sJob(inputURL string, jobConfig JobConfig) (*JobInfo, error) {
 			// Optional: ActiveDeadlineSeconds:,
 			// Optional: Selector:,
 			// Optional: ManualSelector:,
-			BackoffLimit:          &backoff,
+			BackoffLimit:          aws.Int32(int32(MAX_RETRIES)),
 			ActiveDeadlineSeconds: &deadline,
 			Template: k8sv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -323,12 +333,14 @@ func CreateK8sJob(inputURL string, jobConfig JobConfig) (*JobInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	glog.Infoln("New job name: ", newJob.Name)
-	ji := JobInfo{}
-	ji.Name = newJob.Name
-	ji.UID = string(newJob.GetUID())
-	ji.URL = inputURL
-	ji.Retries = 0
-	ji.Status = jobStatusToString(&newJob.Status)
+	glog.Infof("[CreateK8sJob] new job name: %q", newJob.Name)
+	ji := JobInfo{
+		Name:      newJob.Name,
+		UID:       string(newJob.GetUID()),
+		URL:       inputURL,
+		Status:    jobStatusToString(&newJob.Status),
+		jobStatus: &newJob.Status,
+	}
+
 	return &ji, nil
 }

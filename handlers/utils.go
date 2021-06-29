@@ -44,13 +44,13 @@ func GetValueFromJSON(jsonBytes []byte, keys []string) (interface{}, error) {
 		return nil, err
 	}
 	if dataMap == nil {
-		return nil, fmt.Errorf("Can not unmarshal data bytes")
+		return nil, errors.New("can not unmarshal data bytes")
 	}
 	for _, key := range keys {
 		if containKey(dataMap.(map[string]interface{}), key) {
 			dataMap = dataMap.(map[string]interface{})[key]
 		} else {
-			return nil, errors.New(string(jsonBytes) + " does not contain key " + key)
+			return nil, fmt.Errorf("%s does not contain key %s", string(jsonBytes), key)
 		}
 	}
 	return dataMap, nil
